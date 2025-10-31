@@ -1,0 +1,33 @@
+# Compiled Go binaries
+collector
+
+# Compiled eBPF object files
+*.o
+
+# Auto-generated Go files (if using bpf2go)
+bpf_bpfel.go
+bpf_bpfeb.go
+
+# Go build cache and test files
+*.test
+*.prof
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# IDE and environment files
+.vscode/
+.idea/
+
+# Local environment variables
+# IMPORTANT: Never commit your Slack webhook or other secrets.
+.env
+
+# Kind cluster configuration files
+kind-config.yaml
+
+# Log files
+*.log

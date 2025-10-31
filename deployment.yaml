@@ -1,0 +1,55 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: kubecustos-collector
+  labels:
+    app: kubecustos-collector
+spec:
+  selector:
+    matchLabels:
+      app: kubecustos-collector
+  template:
+    metadata:
+      labels:
+        app: kubecustos-collector
+    spec:
+      # hostPID is required for the probe to see all processes on the node.
+      hostPID: true
+      containers:
+      - name: collector
+        # Use the new, correct image tag.
+        image: kubecustos-collector:0.4.0
+        imagePullPolicy: IfNotPresent
+        # privileged is the simplest way to grant all necessary eBPF capabilities.
+        securityContext:
+          privileged: true
+        env:
+        # The Downward API injects the node's name into the pod.
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: SLACK_WEBHOOK_URL
+          valueFrom:
+            secretKeyRef:
+              name: slack-webhook            # The name of the secret we just created
+              key: SLACK_WEBHOOK_URL     # The key inside that secret
+        volumeMounts:
+        # Mount the necessary host paths for eBPF and BTF information.
+        - name: bpf-fs
+          mountPath: /sys/fs/bpf
+        - name: kernel-debug
+          mountPath: /sys/kernel/debug
+        - name: lib-modules
+          mountPath: /lib/modules
+          readOnly: true
+      volumes:
+      - name: bpf-fs
+        hostPath:
+          path: /sys/fs/bpf
+      - name: kernel-debug
+        hostPath:
+          path: /sys/kernel/debug
+      - name: lib-modules
+        hostPath:
+          path: /lib/modules
