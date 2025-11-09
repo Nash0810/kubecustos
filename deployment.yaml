@@ -20,7 +20,7 @@ spec:
       containers:
       - name: collector
         # Use the new, correct image tag.
-        image: kubecustos-collector:0.4.0
+        image: phx.ocir.io/axhke2ki3z5r/kubecustos:1.5
         imagePullPolicy: IfNotPresent
         securityContext:
           privileged: true
@@ -58,3 +58,5 @@ spec:
       - name: host-proc
         hostPath:
           path: /proc
+
+

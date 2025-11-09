@@ -1,0 +1,7 @@
+# Ignore compiled binaries and archives
+*.o
+*.tar.gz
+
+# Ignore git files
+.git
+.gitignore
