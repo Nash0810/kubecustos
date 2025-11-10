@@ -20,7 +20,7 @@ spec:
       containers:
       - name: collector
         # Use the new, correct image tag.
-        image: phx.ocir.io/axhke2ki3z5r/kubecustos:1.5
+        image: phx.ocir.io/axhke2ki3z5r/kubecustos:1.7
         imagePullPolicy: IfNotPresent
         securityContext:
           privileged: true

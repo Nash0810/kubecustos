@@ -20,7 +20,8 @@ RUN CGO_ENABLED=1 GOOS=linux GOARCH=arm64 \
 # --- Stage 3: Final minimal image ---
 FROM --platform=linux/arm64 alpine:latest
 RUN apk add --no-cache ca-certificates
+
 COPY --from=go-builder /collector /usr/local/bin/collector
-# RUN adduser -D nonroot
-# USER nonroot
+
+# The collector must run as root to load eBPF programs
 CMD ["collector"]

@@ -1,12 +1,14 @@
 //go:build ignore
+
 #include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_core_read.h>
 #include <bpf/bpf_tracing.h>
 
 #define TASK_COMM_LEN 16
-#define ARGS_BUF_SIZE 4096 
+#define ARGS_BUF_SIZE 4096
 #define MAX_ARG_SIZE 256
+#define MAX_ARGS 16
 
 struct event {
     u32 pid;
@@ -31,93 +33,35 @@ int handle_execve(struct trace_event_raw_sys_enter *ctx) {
     u32 pid = pid_tgid >> 32;
 
     e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
-    if (!e) {
+    if (!e)
         return 0;
-    }
 
     e->pid = pid;
     task = (struct task_struct *)bpf_get_current_task();
     e->ppid = BPF_CORE_READ(task, real_parent, tgid);
     bpf_get_current_comm(&e->comm, sizeof(e->comm));
+    e->args_count = 0;
 
-    int ret;
-    int offset = 0;
-    
-    // 1. Read the first argument (program name)
     const char *filename = (const char *)ctx->args[0];
-    ret = bpf_probe_read_user_str(&e->args_buf[0], ARGS_BUF_SIZE, filename);
-    if (ret <= 0) {
-        bpf_ringbuf_discard(e, 0);
-        return 0;
-    }
-    
-    if (ret >= ARGS_BUF_SIZE) {
-        ret = ARGS_BUF_SIZE - 1;
-    }
-    offset += ret;
-    
-    // Ensure offset is within bounds (verifier hint)
-    if (offset >= ARGS_BUF_SIZE) {
-        offset = ARGS_BUF_SIZE - 1;
-    }
-    
+    bpf_probe_read_user_str(&e->args_buf[0], MAX_ARG_SIZE, filename);
     e->args_count = 1;
 
-    // 2. Read argv[]
-    const char *argp;
     const void *argv_base = (const void *)ctx->args[1];
-    
+    const char *argp = NULL;
+
     #pragma unroll
-    for (int i = 1; i < 10; i++) {
-        if (offset >= ARGS_BUF_SIZE - MAX_ARG_SIZE - 2) {
-            break; // Not enough space left
-        }
-        
-        // Read pointer to i-th argument
-        ret = bpf_probe_read_user(&argp, sizeof(argp),
+    for (int i = 1; i < MAX_ARGS; i++) {
+        unsigned int offset = i * MAX_ARG_SIZE;
+        if (offset >= ARGS_BUF_SIZE)
+            break;
+
+        bpf_probe_read_user(&argp, sizeof(argp),
                             (void *)(argv_base + (i * sizeof(char *))));
-        if (ret != 0 || !argp) {
-            break; // end of argv array or read failed
-        }
-        
-        if (offset <= 0 || offset >= ARGS_BUF_SIZE) {
+        if (!argp)
             break;
-        }
-        
-        // Add space separator
-        e->args_buf[offset - 1] = ' ';
-        
-        // Calculate remaining space with explicit bounds
-        int remaining_size = ARGS_BUF_SIZE - offset;
-        
-        // Clamp remaining size to MAX_ARG_SIZE
-        if (remaining_size > MAX_ARG_SIZE) {
-            remaining_size = MAX_ARG_SIZE;
-        }
-        
-        // Additional safety check
-        if (remaining_size <= 0) {
-            break;
-        }
-        
-        // Read argument string
-        ret = bpf_probe_read_user_str(&e->args_buf[offset],
-                                      remaining_size, argp);
-        if (ret <= 0) {
-            break; // failed to read
-        }
-        
-        if (ret > remaining_size) {
-            ret = remaining_size;
-        }
-        
+
+        bpf_probe_read_user_str(&e->args_buf[offset], MAX_ARG_SIZE, argp);
         e->args_count++;
-        offset += ret;
-        
-        if (offset >= ARGS_BUF_SIZE) {
-            offset = ARGS_BUF_SIZE - 1;
-            break;
-        }
     }
 
     bpf_ringbuf_submit(e, 0);

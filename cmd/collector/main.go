@@ -39,7 +39,7 @@ type bpfEvent struct {
 	Pid       uint32
 	Ppid      uint32
 	Comm      [16]byte
-	ArgsBuf   [4096]byte
+	ArgsBuf   [4096]byte // ARGS_BUF_SIZE
 	ArgsCount int32
 }
 
@@ -50,6 +50,9 @@ type EnrichedEvent struct {
 	Pod         *v1.Pod
 	NodeName    string
 }
+
+// MAX_ARG_SIZE Must match the C code
+const MAX_ARG_SIZE = 256 
 
 // --- Pod Cache Implementation ---
 
@@ -122,7 +125,11 @@ func (pc *PodCache) refresh() error {
 	return nil
 }
 
-var cgroupRegex = regexp.MustCompile(`.*/(docker|crio|containerd)-?([a-f0-9]{64})\.?`)
+// --- THIS IS THE FIX ---
+// This regex specifically finds the container ID from cgroupv1 paths
+// used by containerd, crio, and docker, based on your log output.
+var cgroupRegex = regexp.MustCompile(`(docker|containerd|crio)-([a-f0-9]{64})\.scope`)
+// --- END FIX ---
 
 func (pc *PodCache) getContainerIDFromPID(pid uint32) (string, bool) {
 	pc.pidLock.RLock()
@@ -138,18 +145,25 @@ func (pc *PodCache) getContainerIDFromPID(pid uint32) (string, bool) {
 		return "", false
 	}
 
+	// --- THIS IS THE FIX ---
+	// We parse the lines to find the cgroupv1-style ID
 	lines := strings.Split(string(content), "\n")
 	for _, line := range lines {
 		matches := cgroupRegex.FindStringSubmatch(line)
+		// matches[0] = "crio-1ea8da...scope"
+		// matches[1] = "crio"
+		// matches[2] = "1ea8da..."
 		if len(matches) == 3 {
-			containerID := matches[2]
+			containerID := matches[2] // The 64-char hex string
 			pc.pidLock.Lock()
 			pc.pidCache[pid] = containerID
 			pc.pidLock.Unlock()
 			return containerID, true
 		}
 	}
-
+	// --- END FIX ---
+	
+	// If no match, it's a host process
 	pc.pidLock.Lock()
 	pc.pidCache[pid] = "" 
 	pc.pidLock.Unlock()
@@ -177,6 +191,7 @@ func (pc *PodCache) FindPodForPID(pid, ppid uint32) *v1.Pod {
 	pod, ok := pc.containerCache[containerID]
 	pc.cacheLock.RUnlock()
 	if !ok {
+		// Cache might be stale, but we don't want to block
 		return nil
 	}
 	return pod
@@ -184,7 +199,7 @@ func (pc *PodCache) FindPodForPID(pid, ppid uint32) *v1.Pod {
 
 // --- End Pod Cache ---
 
-// --- Slack & Rules ---
+// --- Slack & Rules (Corrected) ---
 
 type SlackField struct { Type string `json:"type"`; Text string `json:"text"` }
 type SlackBlock struct { Type string `json:"type"`; Fields []SlackField `json:"fields,omitempty"`; Text *SlackField `json:"text,omitempty"` }
@@ -203,7 +218,7 @@ func sendSlackAlert(alertMsg string, event EnrichedEvent) {
 			{Type: "section", Fields: []SlackField{
 				{Type: "mrkdwn", Text: fmt.Sprintf("*Pod:*\n`%s/%s`", namespace, podName)},
 				{Type: "mrkdwn", Text: fmt.Sprintf("*Node:*\n`%s`", event.NodeName)},
-				{Type: "mrkdwn", Text: fmt.Sprintf("*Process Name:*\n`%s`", event.Comm)},
+				{Type: "mrkdwn",Text: fmt.Sprintf("*Process Name:*\n`%s`", event.Comm)},
 				{Type: "mrkdwn", Text: fmt.Sprintf("*PID:*\n`%d`", event.PID)},
 				{Type: "mrkdwn", Text: fmt.Sprintf("*Time:*\n`%s`", time.Now().UTC().Format(time.RFC1123))},
 			}},
@@ -214,14 +229,21 @@ func sendSlackAlert(alertMsg string, event EnrichedEvent) {
 	http.Post(webhookURL, "application/json", bytes.NewBuffer(payload))
 }
 
+// --- THIS IS THE FIX ---
+// The rules are now more robust and check the FullCommand.
 func checkRules(event EnrichedEvent) string {
+    // Check Comm (kernel process name, 16-char limit)
 	if event.Comm == "xmrig" { return "Potential Crypto Miner" }
+    
+    // Check FullCommand (the complete command line)
+	if strings.Contains(event.FullCommand, "xmrig") { return "Potential Crypto Miner" }
 	if strings.Contains(event.FullCommand, "curl | bash") || strings.Contains(event.FullCommand, "wget | sh") { return "Suspicious Command Pipe" }
 	if strings.HasPrefix(event.FullCommand, "/tmp/") { return "Execution from /tmp" }
 	return ""
 }
+// --- END FIX ---
 
-// --- Main Function ---
+// --- Main Function (Parser Updated) ---
 
 func main() {
 	log.Println("Starting KubeCustos Collector...")
@@ -281,14 +303,37 @@ func main() {
 		}
 
 		sourcePod := podCache.FindPodForPID(event.Pid, event.Ppid)
-
 		comm := unix.ByteSliceToString(event.Comm[:])
 
-        end := bytes.IndexByte(event.ArgsBuf[:], 0)
-        if end == -1 { 
-            end = len(event.ArgsBuf)
+        // --- NEW PARSING LOGIC ---
+        // We now read from fixed-size slots
+        var args []string
+        for i := 0; i < int(event.ArgsCount); i++ {
+            offset := i * MAX_ARG_SIZE
+            if offset >= len(event.ArgsBuf) {
+                break
+            }
+
+            // Find the null terminator in this slot
+            argSlot := event.ArgsBuf[offset:]
+            end := bytes.IndexByte(argSlot, 0)
+            
+            // If no null term, just take the whole slot (or what's left)
+            if end == -1 {
+				if offset+MAX_ARG_SIZE > len(event.ArgsBuf) {
+					end = len(event.ArgsBuf) - offset
+				} else {
+					end = MAX_ARG_SIZE
+				}
+            }
+			
+			// If we have a valid string, add it
+            if end > 0 {
+                args = append(args, string(argSlot[:end]))
+            }
         }
-		fullCommand := string(event.ArgsBuf[:end])
+        fullCommand := strings.Join(args, " ")
+        // --- END NEW LOGIC ---
 
 		enrichedEvent := EnrichedEvent{
 			PID: event.Pid, Comm: comm, FullCommand: fullCommand, Pod: sourcePod, NodeName: nodeName,
