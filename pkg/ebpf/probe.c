@@ -16,6 +16,7 @@ struct event {
     char comm[TASK_COMM_LEN];
     char args_buf[ARGS_BUF_SIZE];
     int args_count;
+    u64 cgroup_id; // capture kernel cgroup inode id
 };
 
 struct {
@@ -36,12 +37,27 @@ int handle_execve(struct trace_event_raw_sys_enter *ctx) {
     if (!e)
         return 0;
 
+    /* Do not call memset helpers (toolchain portability). Instead initialize
+       only the fields we will rely on. This avoids implicit/unsupported helper calls. */
+
+    e->pid = 0;
+    e->ppid = 0;
+    e->comm[0] = '\0';
+    e->args_buf[0] = '\0';
+    e->args_count = 0;
+    e->cgroup_id = 0;
+
     e->pid = pid;
     task = (struct task_struct *)bpf_get_current_task();
     e->ppid = BPF_CORE_READ(task, real_parent, tgid);
-    bpf_get_current_comm(&e->comm, sizeof(e->comm));
-    e->args_count = 0;
 
+    /* Safe read of comm: bpf_get_current_comm writes null-terminated string */
+    bpf_get_current_comm(&e->comm, sizeof(e->comm));
+
+    /* Save cgroup id for userspace pod resolution (stable across short-lived PIDs) */
+    e->cgroup_id = bpf_get_current_cgroup_id();
+
+    /* Read argv[0] */
     const char *filename = (const char *)ctx->args[0];
     bpf_probe_read_user_str(&e->args_buf[0], MAX_ARG_SIZE, filename);
     e->args_count = 1;
