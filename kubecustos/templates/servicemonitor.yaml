@@ -1,0 +1,24 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "kubecustos.fullname" . }}-backend
+  # CRITICAL FIX: Deploy the ServiceMonitor resource into the monitoring namespace 
+  # where the Prometheus Operator is watching for new targets.
+  namespace: monitoring 
+  labels:
+    # This label MUST match the selector Prometheus uses in kube-prometheus-stack
+    release: prometheus 
+    {{- include "kubecustos.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "kubecustos.name" . }}
+      app.kubernetes.io/component: backend
+  endpoints:
+    - port: metrics # Matches the named port 'metrics' in the backend Service
+      path: /metrics
+      interval: 15s
+  namespaceSelector:
+    # This tells Prometheus to look for the actual backend Service in the 'default' namespace
+    matchNames:
+      - default

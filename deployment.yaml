@@ -18,15 +18,20 @@ spec:
 
     spec:
       hostPID: true
+      hostIPC: true
+      hostNetwork: true
       serviceAccountName: kubecustos-collector
 
       containers:
         - name: collector
-          image: phx.ocir.io/axhke2ki3z5r/kubecustos:1.8.8
+          image: phx.ocir.io/axhke2ki3z5r/kubecustos:1.8.9.3
           imagePullPolicy: IfNotPresent
 
           securityContext:
             privileged: true
+            allowPrivilegeEscalation: true
+            seccompProfile:
+              type: Unconfined
 
           env:
             - name: NODE_NAME
@@ -40,7 +45,18 @@ spec:
                   name: slack-webhook
                   key: SLACK_WEBHOOK_URL
 
+            - name: DEBUG
+              value: "1"
+
           volumeMounts:
+            - name: host-proc
+              mountPath: /host/proc
+              readOnly: true
+
+            - name: host-cgroup
+              mountPath: /host/sys/fs/cgroup
+              readOnly: true
+
             - name: bpf-fs
               mountPath: /sys/fs/bpf
 
@@ -51,19 +67,19 @@ spec:
               mountPath: /lib/modules
               readOnly: true
 
-            - name: host-proc
-              mountPath: /host/proc
-              readOnly: true
-
-            - name: host-cgroup
-              mountPath: /host/sys/fs/cgroup
-              readOnly: true
-
             - name: host-run
               mountPath: /host/run
               readOnly: true
 
       volumes:
+        - name: host-proc
+          hostPath:
+            path: /proc
+
+        - name: host-cgroup
+          hostPath:
+            path: /sys/fs/cgroup
+
         - name: bpf-fs
           hostPath:
             path: /sys/fs/bpf
@@ -75,14 +91,6 @@ spec:
         - name: lib-modules
           hostPath:
             path: /lib/modules
-
-        - name: host-proc
-          hostPath:
-            path: /proc
-
-        - name: host-cgroup
-          hostPath:
-            path: /sys/fs/cgroup
 
         - name: host-run
           hostPath:

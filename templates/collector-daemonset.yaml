@@ -1,0 +1,73 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "kubecustos.fullname" . }}-collector
+  labels:
+    app.kubernetes.io/component: collector
+    {{- include "kubecustos.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "kubecustos.name" . }}
+      app.kubernetes.io/component: collector
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ include "kubecustos.name" . }}
+        app.kubernetes.io/component: collector
+    spec:
+      serviceAccountName: {{ include "kubecustos.fullname" . }}-collector-sa
+      hostPID: true # CRITICAL: Required to read host PIDs
+      
+      containers:
+        - name: collector
+          image: {{ .Values.collector.image }}
+          imagePullPolicy: IfNotPresent
+          
+          securityContext:
+            privileged: true # CRITICAL: Required for eBPF attachment
+
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName # Pass K8s node name to collector
+            
+            - name: BACKEND_URL
+              # Point the collector to the internal ClusterIP Service
+              value: "http://{{ include "kubecustos.fullname" . }}-backend:{{ .Values.backend.service.port }}/api/v1"
+            
+            # Use Kubernetes Secret for sensitive webhook URL
+            - name: SLACK_WEBHOOK_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "kubecustos.fullname" . }}-secrets
+                  key: SLACK_WEBHOOK_URL
+            
+            - name: DEBUG
+              value: "0"
+
+          resources:
+            {{- toYaml .Values.collector.resources | nindent 12 }}
+
+          volumeMounts:
+            # CRITICAL: Mount host paths for eBPF and PID resolution
+            - name: bpf-fs
+              mountPath: /sys/fs/bpf
+            - name: host-proc
+              mountPath: /host/proc
+              readOnly: true
+            - name: host-cgroup
+              mountPath: /sys/fs/cgroup
+              readOnly: true
+
+      volumes:
+        - name: bpf-fs
+          hostPath:
+            path: /sys/fs/bpf
+        - name: host-proc
+          hostPath:
+            path: /proc
+        - name: host-cgroup
+          hostPath:
+            path: /sys/fs/cgroup

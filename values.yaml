@@ -1,0 +1,54 @@
+# --- GLOBAL CONFIGURATION ---
+imageRegistry: phx.ocir.io/axhke2ki3z5r/kubecustos
+imageTag: v1.0.0-arm64 # Your ARM64 image tag
+backendPort: 8080
+
+# --- Collector DaemonSet Configuration (eBPF Agent) ---
+collector:
+  name: collector
+  image: "{{ .Values.imageRegistry }}-collector:{{ .Values.imageTag }}"
+  replicas: 1
+  securityContext:
+    privileged: true
+  hostPID: true
+  resources:
+    limits:
+      cpu: 250m
+      memory: 256Mi
+    requests:
+      cpu: 100m
+      memory: 128Mi
+
+# --- Backend Deployment Configuration (API, Rules, Persistence) ---
+backend:
+  name: backend
+  image: "{{ .Values.imageRegistry }}-backend:{{ .Values.imageTag }}"
+  replicas: 1
+  resources:
+    limits:
+      cpu: 500m
+      memory: 512Mi
+    requests:
+      cpu: 200m
+      memory: 256Mi
+  service:
+    type: ClusterIP
+    port: 8080
+
+# --- External Configuration (Secrets and ConfigMap) ---
+slack:
+  webhookUrl: "" # Provide this value during installation
+
+# --- PostgreSQL Sub-Chart Configuration (Bitnami) ---
+postgresql:
+  enabled: true
+  auth:
+    database: ebpf_events
+    username: ebpfuser
+    password: changeme_production 
+    image:
+      tag: 15.6.0-debian-12-r22 
+  persistence:
+    enabled: true
+    size: 8Gi
+    storageClass: "" # Use OKE default or specify if needed

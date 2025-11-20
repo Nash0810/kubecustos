@@ -23,9 +23,11 @@ import (
 	"github.com/cilium/ebpf/ringbuf"
 	"golang.org/x/sys/unix"
 
-	// Local informer-based cache
-	"github.com/nash-d/kubecustos/pkg/k8s"
-
+	// Existing KubeCustos packages
+	"github.com/nash0810/kubecustos/pkg/k8s" 
+	// NEW: Import the shared models package for event structure
+	"github.com/nash0810/kubecustos/pkg/models" 
+	"k8s.io/client-go/tools/clientcmd" // CRITICAL for local fallback
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -34,7 +36,7 @@ import (
 //go:embed probe.o
 var bpfObject []byte
 
-// bpfEvent must exactly match the C struct emitted by the eBPF program.
+// bpfEvent must exactly match the C struct emitted by the probe
 type bpfEvent struct {
 	Pid       uint32
 	Ppid      uint32
@@ -43,260 +45,227 @@ type bpfEvent struct {
 	ArgsCount int32
 }
 
-type EnrichedEvent struct {
+// LocalEventContext holds data required for local enrichment before forwarding.
+type LocalEventContext struct {
 	PID         uint32
+	PPID        uint32
 	Comm        string
 	FullCommand string
 	Pod         *v1.Pod
 	NodeName    string
 }
 
-const MAX_ARG_SIZE = 256
+// Debug toggle via env var DEBUG=1
+var debugEnabled bool
 
-// --- PID -> containerID cache (local, avoids re-reading /proc repeatedly) ---
-var (
-	pidCache   = make(map[uint32]string)
-	pidCacheMu sync.RWMutex
-)
-
-// Some tolerant regexes for multiple runtimes:
-// - CRI-O (crio-<64>.scope)
-// - containerd / cri-containerd / cri-o .scope variants
-// - docker systemd .scope
-// Additionally we'll scan for any 64-hex substring if runtime keywords exist in the line.
-var (
-	// match explicit <runtime>-<64hex>.scope e.g. crio-<id>.scope or cri-containerd-<id>.scope
-	scopeRuntimeRe = regexp.MustCompile(`(?i)(crio|cri-containerd|containerd|docker)-([a-f0-9]{64})\.scope`)
-	// match docker/containerd style path segments that include a 64 hex id
-	genericHex64Re = regexp.MustCompile(`([a-f0-9]{64})`)
-	// runtime keywords to reduce false positives
-	runtimeKeywords = []string{"crio", "containerd", "cri-containerd", "docker", "kubepods", "docker-"}
-
-	// quick cgroup v2 pattern: look for "kubepods.slice/.../docker-<id>.scope" or similar.
-	cgroupIDRe = regexp.MustCompile(`(?:docker|containerd|crio|cri-containerd)[\-/]([a-f0-9]{64})`)
-)
-
-// getContainerIDFromPID reads /host/proc/<pid>/cgroup and extracts a container id when possible.
-// Returns (containerID, true) when file was read and extract succeeded or was definitely host (empty id with true).
-// Returns ("", false) when file could not be read (process likely exited).
-func getContainerIDFromPID(pid uint32) (string, bool) {
-	// fast local cache
-	pidCacheMu.RLock()
-	if v, ok := pidCache[pid]; ok {
-		pidCacheMu.RUnlock()
-		// found in cache; second return indicates "we read it before" (true)
-		// but if v=="" it means host process previously determined
-		return v, true
+func dbg(format string, a ...interface{}) {
+	if debugEnabled {
+		log.Printf("[DEBUG] "+format, a...)
 	}
-	pidCacheMu.RUnlock()
+}
 
-	path := fmt.Sprintf("/host/proc/%d/cgroup", pid)
-	b, err := os.ReadFile(path)
+// Regex to extract container ID from CRI-O cgroup paths
+var cgroupRegex = regexp.MustCompile(`crio-([a-f0-9]{64})\.scope`) 
+
+// pidCache caches pid -> containerID (or "" for host)
+var (
+	pidCache = make(map[uint32]string)
+	pidLock  = sync.RWMutex{}
+)
+
+// getContainerIDFromPID reads /host/proc/PID/cgroup and extracts the container ID
+func getContainerIDFromPID(pid uint32) (string, bool) {
+	pidLock.RLock()
+	if cid, ok := pidCache[pid]; ok {
+		pidLock.RUnlock()
+		dbg("pidCache HIT pid=%d cid=%q", pid, cid)
+		return cid, true
+	}
+	pidLock.RUnlock()
+
+	cgroupPath := fmt.Sprintf("/host/proc/%d/cgroup", pid)
+	content, err := os.ReadFile(cgroupPath)
 	if err != nil {
-		// cannot read for this pid (likely exited) -> treat as transient; caller will ignore event
+		dbg("could not read cgroup for pid=%d: %v", pid, err)
 		return "", false
 	}
-	content := string(b)
 
-	// Try explicit scope runtime pattern
-	if m := scopeRuntimeRe.FindStringSubmatch(content); len(m) == 3 {
-		id := m[2]
-		pidCacheMu.Lock()
-		pidCache[pid] = id
-		pidCacheMu.Unlock()
-		return id, true
+	txt := string(content)
+	if matches := cgroupRegex.FindStringSubmatch(txt); len(matches) == 2 {
+		cid := matches[1]
+		pidLock.Lock()
+		pidCache[pid] = cid
+		pidLock.Unlock()
+		dbg("extracted containerID=%s for pid=%d", cid, pid)
+		return cid, true
 	}
 
-	// Try cgroupIDRe (combined)
-	if m := cgroupIDRe.FindStringSubmatch(content); len(m) == 2 {
-		id := m[1]
-		pidCacheMu.Lock()
-		pidCache[pid] = id
-		pidCacheMu.Unlock()
-		return id, true
-	}
-
-	// Generic scan for 64-hex but only accept if runtime keywords appear in the same content
-	hasKeyword := false
-	for _, kw := range runtimeKeywords {
-		if strings.Contains(content, kw) {
-			hasKeyword = true
-			break
-		}
-	}
-	if hasKeyword {
-		if gm := genericHex64Re.FindStringSubmatch(content); len(gm) == 2 {
-			id := gm[1]
-			pidCacheMu.Lock()
-			pidCache[pid] = id
-			pidCacheMu.Unlock()
-			return id, true
-		}
-	}
-
-	// No runtime container id found -> host process
-	pidCacheMu.Lock()
-	pidCache[pid] = "" // cache host result so we don't re-read repeatedly
-	pidCacheMu.Unlock()
+	// Not in a container (host process)
+	pidLock.Lock()
+	pidCache[pid] = ""
+	pidLock.Unlock()
+	dbg("pid=%d is a host process (no container id)", pid)
 	return "", true
 }
 
-// FindPodForPID tries to resolve PID -> containerID -> Pod (via podCache).
-// Returns nil when host or unknown.
-func FindPodForPID(podCache *k8s.PodCache, pid, ppid uint32) *v1.Pod {
+// FindPodForPID tries the PID first, then falls back to PPID
+func FindPodForPID(podCache *k8s.PodCache, pid, ppid uint32) (string, *v1.Pod) {
+	dbg("[FIND] resolving pod for pid=%d ppid=%d", pid, ppid)
+
 	containerID, ok := getContainerIDFromPID(pid)
 	if !ok {
-		// transient read error: treat as "don't know"
-		return nil
+		return "", nil
 	}
 
-	// if not in a container, try parent (ppid)
+	// Try parent PID if current PID is host
 	if containerID == "" && ppid > 1 {
+		dbg("[FIND] pid=%d is host; trying ppid=%d", pid, ppid)
 		containerID, ok = getContainerIDFromPID(ppid)
 		if !ok {
-			return nil
+			return "", nil
 		}
 	}
-
+	
 	if containerID == "" {
-		// host
-		return nil
+		dbg("[FIND] pid=%d and ppid=%d resolved to host process", pid, ppid)
+		return "", nil
 	}
 
-	// PodCache handles informer store scan and API fallback as needed
-	return podCache.FindPodByContainerID(containerID)
+	dbg("[FIND] looking up Pod for containerID=%s", containerID)
+	pod := podCache.FindPodByContainerID(containerID)
+	if pod != nil {
+		dbg("[FIND] resolved containerID=%s -> pod=%s/%s", containerID, pod.Namespace, pod.Name)
+	} else {
+		dbg("[FIND] containerID=%s -> no pod found (host or short-lived)", containerID)
+	}
+	return containerID, pod
 }
 
-// --- Slack / Alert helpers (unchanged, minor cleanup) ---
-
-type SlackField struct {
-	Type string `json:"type"`
-	Text string `json:"text"`
-}
-
-type SlackBlock struct {
-	Type   string       `json:"type"`
-	Fields []SlackField `json:"fields,omitempty"`
-	Text   *SlackField  `json:"text,omitempty"`
-}
-
-type SlackPayload struct {
-	Blocks []SlackBlock `json:"blocks"`
-}
-
-func sendSlackAlert(alertMsg string, event EnrichedEvent) {
-	webhookURL := os.Getenv("SLACK_WEBHOOK_URL")
-	if webhookURL == "" {
+// sendToBackend converts the enriched event and sends it via HTTP to the backend service.
+func sendToBackend(event LocalEventContext, containerID string) {
+	backendURL := os.Getenv("BACKEND_URL")
+	if backendURL == "" {
+		dbg("BACKEND_URL not set, skipping event forwarding.")
 		return
 	}
 
+	// Prepare data for JSON serialization (using the shared models struct)
 	podName, namespace := "host", "host"
+	hostProcess := true
 	if event.Pod != nil {
 		podName = event.Pod.Name
 		namespace = event.Pod.Namespace
+		hostProcess = false
 	}
 
-	msg := SlackPayload{
-		Blocks: []SlackBlock{
-			{
-				Type: "header",
-				Text: &SlackField{
-					Type: "plain_text",
-					Text: fmt.Sprintf("🚨 KubeCustos Alert: %s", alertMsg),
-				},
-			},
-			{
-				Type: "section",
-				Fields: []SlackField{
-					{Type: "mrkdwn", Text: fmt.Sprintf("*Pod:*\n`%s/%s`", namespace, podName)},
-					{Type: "mrkdwn", Text: fmt.Sprintf("*Node:*\n`%s`", event.NodeName)},
-					{Type: "mrkdwn", Text: fmt.Sprintf("*Process Name:*\n`%s`", event.Comm)},
-					{Type: "mrkdwn", Text: fmt.Sprintf("*PID:*\n`%d`", event.PID)},
-					{Type: "mrkdwn", Text: fmt.Sprintf("*Time:*\n`%s`", time.Now().UTC().Format(time.RFC1123))},
-				},
-			},
-			{
-				Type: "section",
-				Text: &SlackField{
-					Type: "mrkdwn",
-					Text: fmt.Sprintf("*Full Command:*\n```%s```", event.FullCommand),
-				},
-			},
-		},
+	payload := models.EnrichedEvent{
+		PID:         event.PID,
+		PPID:        event.PPID,
+		Comm:        event.Comm,
+		FullCommand: event.FullCommand,
+		PodName:     podName,
+		Namespace:   namespace,
+		NodeName:    event.NodeName,
+		ContainerID: containerID,
+		HostProcess: hostProcess,
+		Timestamp:   time.Now().UTC(),
 	}
 
-	payload, _ := json.Marshal(msg)
-	_, _ = http.Post(webhookURL, "application/json", bytes.NewBuffer(payload))
+	data, err := json.Marshal(payload)
+	if err != nil {
+		log.Printf("Failed to marshal event JSON: %v", err)
+		return
+	}
+
+	// Send event data to the backend's /api/v1/events endpoint
+	resp, err := http.Post(backendURL+"/api/v1/events", "application/json", bytes.NewBuffer(data))
+	if err != nil {
+		log.Printf("Failed to send event to backend: %v", err)
+	} else if resp.StatusCode != http.StatusAccepted {
+		log.Printf("Backend rejected event (Status: %d)", resp.StatusCode)
+	} else {
+		dbg("Successfully forwarded event for pid=%d to backend", event.PID)
+	}
 }
 
-// --- Detection rules ---
-func checkRules(event EnrichedEvent) string {
-	// ignore noisy runtime daemons that run on host
-	if event.Comm == "iptables" || strings.HasPrefix(event.Comm, "runc") ||
-		event.Comm == "conmon" || strings.HasPrefix(event.Comm, "containerd-shim") ||
-		strings.HasPrefix(event.Comm, "containerd") || event.Comm == "dockerd" {
-		return ""
-	}
 
-	// crypto miner
-	if strings.Contains(event.FullCommand, "xmrig") || event.Comm == "xmrig" {
-		return "Potential Crypto Miner"
-	}
-
-	// supply-chain patterns (simple)
-	if strings.Contains(event.FullCommand, "curl") && strings.Contains(event.FullCommand, "bash") {
-		return "Suspicious Command Pipe"
-	}
-	if strings.Contains(event.FullCommand, "wget") && strings.Contains(event.FullCommand, "sh") {
-		return "Suspicious Command Pipe"
-	}
-
-	// execution from /tmp
-	if strings.HasPrefix(event.FullCommand, "/tmp/") {
-		return "Execution from /tmp"
-	}
-
-	return ""
-}
-
-// --- main ---
+// --- Main Function ---
 func main() {
-	log.Println("Starting KubeCustos Collector...")
+	// DEBUG env toggle
+	debugEnabled = os.Getenv("DEBUG") == "1"
+	if debugEnabled {
+		log.Printf("[DEBUG] Debug logging ENABLED")
+	} else {
+		log.Printf("[INFO] Debug logging DISABLED")
+	}
+
+	log.Println("Starting KubeCustos Collector (Forwarding Mode)...")
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// in-cluster client
-	config, err := rest.InClusterConfig()
-	if err != nil {
-		log.Fatalf("failed to get in-cluster config: %v", err)
+	// --- CORRECTED KUBERNETES CLIENT SETUP ---
+	log.Println("Attempting to load Kubernetes configuration...")
+    
+	var config *rest.Config
+	var err error
+	
+	// 1. Try to load local kubeconfig file (via KUBECONFIG env or default path)
+	kubeconfig := os.Getenv("KUBECONFIG")
+	if kubeconfig == "" {
+		kubeconfig = clientcmd.RecommendedHomeFile
 	}
+
+	config, err = clientcmd.BuildConfigFromFlags("", kubeconfig)
+	
+	// 2. If local config fails, attempt to load in-cluster config (for final deployment)
+	if err != nil {
+		log.Printf("Warning: Failed to load local kubeconfig (%v). Falling back to in-cluster configuration...", err)
+		config, err = rest.InClusterConfig()
+		if err != nil {
+			// If both fail, this is a fatal error
+			log.Fatalf("Failed to get in-cluster config or local fallback: %v", err)
+		}
+	}
+	log.Println("Successfully loaded Kubernetes configuration.")
+    // --- END CORRECTED KUBERNETES CLIENT SETUP ---
+
+
 	clientset, err := kubernetes.NewForConfig(config)
 	if err != nil {
-		log.Fatalf("failed to create k8s clientset: %v", err)
+		log.Fatalf("Failed to create k8s clientset: %v", err)
 	}
 
 	nodeName := os.Getenv("NODE_NAME")
 	if nodeName == "" {
-		log.Fatal("NODE_NAME not set")
+		log.Fatal("NODE_NAME environment variable not set")
+	}
+	
+	// Check BACKEND URL early
+	if os.Getenv("BACKEND_URL") == "" {
+		log.Fatal("BACKEND_URL environment variable not set. Cannot forward events.")
 	}
 
-	// start pod cache
+	// Initialize and start the Informer-based pod cache
 	log.Println("Starting Pod cache informer...")
 	podCache := k8s.NewPodCache(clientset, nodeName)
+	// Placeholder for k8s.SetDebug (assuming it exists in pkg/k8s)
+	// k8s.SetDebug(debugEnabled) 
+
 	if !podCache.Run(ctx) {
-		log.Fatal("failed to sync pod cache informer")
+		log.Fatal("Failed to sync pod cache informer")
 	}
 	log.Println("Pod cache synced successfully.")
 
-	// eBPF setup
-	if err := unix.Setrlimit(unix.RLIMIT_MEMLOCK, &unix.Rlimit{Cur: unix.RLIM_INFINITY, Max: unix.RLIM_INFINITY}); err != nil {
-		log.Printf("warning: setrlimit failed: %v", err)
-	}
+	// Setup eBPF
+	unix.Setrlimit(unix.RLIMIT_MEMLOCK, &unix.Rlimit{
+		Cur: unix.RLIM_INFINITY,
+		Max: unix.RLIM_INFINITY,
+	})
 
 	spec, err := ebpf.LoadCollectionSpecFromReader(bytes.NewReader(bpfObject))
 	if err != nil {
-		log.Fatalf("failed to load eBPF spec: %v", err)
+		log.Fatalf("Failed to load eBPF spec: %v", err)
 	}
 
 	var objs struct {
@@ -304,7 +273,7 @@ func main() {
 		Events       *ebpf.Map     `ebpf:"events"`
 	}
 	if err := spec.LoadAndAssign(&objs, nil); err != nil {
-		log.Fatalf("failed to load eBPF objects: %v", err)
+		log.Fatalf("Failed to load eBPF objects: %v", err)
 	}
 	defer objs.HandleExecve.Close()
 	defer objs.Events.Close()
@@ -333,7 +302,7 @@ func main() {
 		record, err := rd.Read()
 		if err != nil {
 			if errors.Is(err, ringbuf.ErrClosed) {
-				log.Println("ringbuf closed, exiting")
+				log.Println("Ringbuf closed, exiting event loop.")
 				return
 			}
 			continue
@@ -344,39 +313,40 @@ func main() {
 			continue
 		}
 
-		sourcePod := FindPodForPID(podCache, event.Pid, event.Ppid)
-		comm := unix.ByteSliceToString(event.Comm[:])
+		commStr := unix.ByteSliceToString(event.Comm[:])
+		dbg("[EVENT] pid=%d ppid=%d comm=%s argsCount=%d", event.Pid, event.Ppid, commStr, event.ArgsCount)
 
-		// parse args: args are concatenated null-terminated strings in ArgsBuf
+		// Parse arguments
 		argBytes := event.ArgsBuf[:]
 		var args []string
 		start := 0
-		for i := 0; i < len(argBytes) && len(args) < int(event.ArgsCount); i++ {
+		for i := 0; i < len(argBytes); i++ {
 			if argBytes[i] == 0 {
 				if i > start {
 					args = append(args, string(argBytes[start:i]))
 				}
 				start = i + 1
+				if len(args) >= int(event.ArgsCount) {
+					break
+				}
 			}
 		}
 		fullCommand := strings.Join(args, " ")
+		dbg("[EVENT] pid=%d parsed fullCommand=%q", event.Pid, fullCommand)
 
-		enriched := EnrichedEvent{
+		// Look up Pod and get the raw Container ID
+		containerID, sourcePod := FindPodForPID(podCache, event.Pid, event.Ppid)
+
+		localEvent := LocalEventContext{
 			PID:         event.Pid,
-			Comm:        comm,
+			PPID:        event.Ppid,
+			Comm:        commStr,
 			FullCommand: fullCommand,
 			Pod:         sourcePod,
 			NodeName:    nodeName,
 		}
 
-		if msg := checkRules(enriched); msg != "" {
-			log.Printf("🚨 ALERT 🚨: %s triggered (pid=%d comm=%s pod=%v)", msg, enriched.PID, enriched.Comm, func() string {
-				if enriched.Pod == nil {
-					return "host"
-				}
-				return fmt.Sprintf("%s/%s", enriched.Pod.Namespace, enriched.Pod.Name)
-			}())
-			go sendSlackAlert(msg, enriched)
-		}
+		// FORWARD EVENT TO BACKEND SERVICE
+		go sendToBackend(localEvent, containerID)
 	}
 }

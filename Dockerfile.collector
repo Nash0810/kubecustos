@@ -1,0 +1,45 @@
+# Use the official multi-arch Go image as the builder
+FROM golang:1.24-alpine AS builder
+
+# Set the intended target architecture for the build stage
+ENV TARGETARCH=arm64
+
+WORKDIR /app
+
+# Install necessary kernel build dependencies (clang, llvm) for eBPF probe compilation
+# These packages are typically required to compile the C probe.
+RUN apk add --no-cache \
+    clang \
+    llvm \
+    make \
+    musl-dev \
+    gcc \
+    linux-headers 
+
+# Copy module files and download dependencies
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Copy source code (includes pkg/ebpf/probe.c)
+COPY . .
+
+# Compile the eBPF probe (probe.c -> probe.o)
+RUN make -C pkg/ebpf
+
+# Copy the compiled probe into the collector directory for go:embed
+RUN cp pkg/ebpf/probe.o cmd/collector/probe.o
+
+# Cross-compile the Go application for ARM64
+# CGO_ENABLED=1 is required for eBPF
+RUN CGO_ENABLED=1 GOOS=linux GOARCH=${TARGETARCH} go build -o /collector ./cmd/collector
+
+
+# Final stage: minimal base image
+FROM alpine:3.18.5 AS final
+RUN apk add --no-cache ca-certificates
+
+# Copy the built binary
+COPY --from=builder /collector /collector
+
+# Command to run the collector
+ENTRYPOINT ["/collector"]

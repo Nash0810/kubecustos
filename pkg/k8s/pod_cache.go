@@ -8,9 +8,10 @@ import (
 	"time"
 
 	v1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1" // CRITICAL: Contains ListOptions
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
+	//"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 	"golang.org/x/sync/singleflight"
 )
@@ -34,7 +35,7 @@ func NewPodCache(client kubernetes.Interface, nodeName string) *PodCache {
 	factory := informers.NewSharedInformerFactoryWithOptions(
 		client,
 		30*time.Minute, // resync period
-		informers.WithTweakListOptions(func(options *metav1.ListOptions) {
+		informers.WithTweakListOptions(func(options *metav1.ListOptions) { // Uses metav1.ListOptions
 			options.FieldSelector = "spec.nodeName=" + nodeName
 		}),
 	)
@@ -59,17 +60,15 @@ func NewPodCache(client kubernetes.Interface, nodeName string) *PodCache {
 }
 
 // Run starts the informer and waits for it to sync.
-// Returns true if sync is successful, false otherwise.
+// It accepts context.Context, which is required by the collector's call signature.
 func (pc *PodCache) Run(ctx context.Context) bool {
-	go pc.informer.Run(ctx.Done())
+	// FIX 2: Correctly uses ctx.Done() (<-chan struct{}) as required by informer.Run
+	go pc.informer.Run(ctx.Done()) 
 	return cache.WaitForCacheSync(ctx.Done(), pc.informer.HasSynced)
 }
 
 // FindPodByContainerID returns the Pod for the given container ID.
-// Steps:
-//  1) fast map lookup
-//  2) scan informer's store (local, cheap)
-//  3) optional API fallback (limited to this node) guarded by singleflight to avoid thundering
+// FIX 1: This method MUST exist for the collector to compile.
 func (pc *PodCache) FindPodByContainerID(containerID string) *v1.Pod {
 	if containerID == "" {
 		return nil

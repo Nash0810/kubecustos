@@ -1,0 +1,26 @@
+# Use a multi-arch Go base image
+FROM golang:1.24-alpine AS builder
+
+WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+
+# Build the backend binary for ARM64
+ENV TARGETARCH=arm64
+RUN CGO_ENABLED=1 GOOS=linux GOARCH=${TARGETARCH} go build -o /backend ./cmd/backend
+
+
+# Final stage: minimal base image
+FROM alpine:3.18.5 AS final
+RUN apk add --no-cache ca-certificates
+
+# Copy the built binary
+COPY --from=builder /backend /backend
+
+# Expose the default port
+EXPOSE 8080
+
+# Command to run the backend
+ENTRYPOINT ["/backend"]

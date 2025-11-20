@@ -1,0 +1,59 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "kubecustos.fullname" . }}-backend
+  labels:
+    app.kubernetes.io/component: backend
+    {{- include "kubecustos.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.backend.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "kubecustos.name" . }}
+      app.kubernetes.io/component: backend
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ include "kubecustos.name" . }}
+        app.kubernetes.io/component: backend
+    spec:
+      containers:
+        - name: backend
+          image: {{ .Values.backend.image }}
+          imagePullPolicy: IfNotPresent
+          
+          ports:
+            - name: http
+              containerPort: {{ .Values.backend.service.port }}
+              protocol: TCP
+            - name: metrics
+              containerPort: 9090 # Prometheus standard metrics port
+              protocol: TCP
+
+          env:
+            # CRITICAL: Database connection string using the PostgreSQL dependency service name
+            - name: DATABASE_URL
+              value: "postgres://{{ .Values.postgresql.auth.username }}:{{ .Values.postgresql.auth.password }}@{{ include "kubecustos.fullname" . }}-postgresql/{{ .Values.postgresql.auth.database }}?sslmode=disable"
+            
+            # Use Kubernetes Secret for sensitive webhook URL
+            - name: SLACK_WEBHOOK_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "kubecustos.fullname" . }}-secrets
+                  key: SLACK_WEBHOOK_URL
+          
+          resources:
+            {{- toYaml .Values.backend.resources | nindent 12 }}
+          
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
