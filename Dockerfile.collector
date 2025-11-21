@@ -29,9 +29,10 @@ RUN make -C pkg/ebpf
 # Copy the compiled probe into the collector directory for go:embed
 RUN cp pkg/ebpf/probe.o cmd/collector/probe.o
 
+
 # Cross-compile the Go application for ARM64
 # CGO_ENABLED=1 is required for eBPF
-RUN CGO_ENABLED=1 GOOS=linux GOARCH=${TARGETARCH} go build -o /collector ./cmd/collector
+RUN CGO_ENABLED=1 GOOS=linux GOARCH=${TARGETARCH} go build -o /kubecustos-collector ./cmd/collector
 
 
 # Final stage: minimal base image
@@ -39,7 +40,8 @@ FROM alpine:3.18.5 AS final
 RUN apk add --no-cache ca-certificates
 
 # Copy the built binary
-COPY --from=builder /collector /collector
+# Install binary with project-prefixed name
+COPY --from=builder /kubecustos-collector /kubecustos-collector
 
-# Command to run the collector
-ENTRYPOINT ["/collector"]
+# Command to run the collector (project-named binary)
+ENTRYPOINT ["/kubecustos-collector"]

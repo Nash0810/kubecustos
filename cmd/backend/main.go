@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gorilla/mux"
@@ -21,6 +22,11 @@ import (
 
 var (
 	db *sql.DB
+
+	// In-memory fallback stores for local development (used when DATABASE_URL is not set)
+	memEvents = make([]models.EnrichedEvent, 0)
+	memAlerts = make([]models.Alert, 0)
+	memLock   = &sync.Mutex{}
 
 	// Prometheus Metrics
 	eventsProcessed = prometheus.NewCounter(prometheus.CounterOpts{
@@ -45,7 +51,8 @@ func init() {
 func connectDB() {
 	connStr := os.Getenv("DATABASE_URL")
 	if connStr == "" {
-		log.Fatal("DATABASE_URL environment variable is not set")
+		log.Println("DATABASE_URL not set — running in-memory fallback (no Postgres). To enable Postgres set DATABASE_URL env var.")
+		return
 	}
 
 	var err error
@@ -115,34 +122,49 @@ func handleEvents(w http.ResponseWriter, r *http.Request) {
 	eventsProcessed.Inc()
 	log.Printf("Received event: %s in %s/%s", event.Comm, event.Namespace, event.PodName)
 
-	// Phase 1: Store Event
+	// Phase 1: Store Event (Postgres if available, otherwise in-memory)
 	var eventID int64
-	err := db.QueryRow(`
-		INSERT INTO events (timestamp, pod_name, namespace, node_name, pid, ppid, process_name, command_line, container_id) 
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) 
-		RETURNING id`,
-		event.Timestamp, event.PodName, event.Namespace, event.NodeName, event.PID, event.PPID, event.Comm, event.FullCommand, event.ContainerID).Scan(&eventID)
-	
-	if err != nil {
-		log.Printf("Failed to store event: %v", err)
-		http.Error(w, "Internal server error during persistence", http.StatusInternalServerError)
-		return
+	if db != nil {
+		err := db.QueryRow(`
+			INSERT INTO events (timestamp, pod_name, namespace, node_name, pid, ppid, process_name, command_line, container_id) 
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) 
+			RETURNING id`,
+			event.Timestamp, event.PodName, event.Namespace, event.NodeName, event.PID, event.PPID, event.Comm, event.FullCommand, event.ContainerID).Scan(&eventID)
+		if err != nil {
+			log.Printf("Failed to store event in DB: %v", err)
+			http.Error(w, "Internal server error during persistence", http.StatusInternalServerError)
+			return
+		}
+	} else {
+		// In-memory fallback
+		memLock.Lock()
+		eventID = int64(len(memEvents) + 1)
+		memEvents = append(memEvents, event)
+		memLock.Unlock()
 	}
 
 	// Phase 2: Run Rule Engine
 	if alert := checkRules(event); alert.RuleName != "" {
 		alert.EventID = eventID
-		
-		// Phase 3: Store Alert
-		_, err := db.Exec(`
-			INSERT INTO alerts (timestamp, rule_name, severity, pod_name, namespace, node_name, full_command, event_id)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-			alert.Timestamp, alert.RuleName, alert.Severity, alert.PodName, alert.Namespace, alert.NodeName, alert.FullCommand, alert.EventID)
 
-		if err != nil {
-			log.Printf("Failed to store alert: %v", err)
-			// Continue, as event was stored
+		if db != nil {
+			// Phase 3: Store Alert in Postgres
+			_, err := db.Exec(`
+				INSERT INTO alerts (timestamp, rule_name, severity, pod_name, namespace, node_name, full_command, event_id)
+				VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+				alert.Timestamp, alert.RuleName, alert.Severity, alert.PodName, alert.Namespace, alert.NodeName, alert.FullCommand, alert.EventID)
+			if err != nil {
+				log.Printf("Failed to store alert: %v", err)
+			} else {
+				alertsTotal.WithLabelValues(alert.RuleName, alert.Severity).Inc()
+				go sendSlackAlert(alert, event)
+			}
 		} else {
+			// In-memory alert
+			memLock.Lock()
+			alert.ID = int64(len(memAlerts) + 1)
+			memAlerts = append(memAlerts, alert)
+			memLock.Unlock()
 			alertsTotal.WithLabelValues(alert.RuleName, alert.Severity).Inc()
 			go sendSlackAlert(alert, event)
 		}
@@ -242,35 +264,71 @@ func sendSlackAlert(alert models.Alert, event models.EnrichedEvent) {
 	}
 	
 	resp, err := http.Post(webhookURL, "application/json", bytes.NewBuffer(payload))
-	if err != nil || resp.StatusCode != http.StatusOK {
-		log.Printf("Failed to send Slack alert (Status: %d, Error: %v)", resp.StatusCode, err)
+	if err != nil {
+		log.Printf("Failed to send Slack alert: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		log.Printf("Slack webhook returned non-2xx status: %d", resp.StatusCode)
 	}
 }
 
 // handleHealth provides a simple health check.
 func handleHealth(w http.ResponseWriter, r *http.Request) {
 	backendRequestsTotal.WithLabelValues("/health").Inc()
-	if err := db.Ping(); err != nil {
-		http.Error(w, "Database connection failed", http.StatusInternalServerError)
-		return
+	if db != nil {
+		if err := db.Ping(); err != nil {
+			http.Error(w, "Database connection failed", http.StatusInternalServerError)
+			return
+		}
 	}
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("OK"))
 }
 
+// handleGetAlerts returns recent alerts (from Postgres if configured, otherwise in-memory)
+func handleGetAlerts(w http.ResponseWriter, r *http.Request) {
+	backendRequestsTotal.WithLabelValues("/api/v1/alerts").Inc()
+	var out []models.Alert
+	if db != nil {
+		rows, err := db.Query(`SELECT id, timestamp, rule_name, severity, pod_name, namespace, node_name, full_command, event_id FROM alerts ORDER BY timestamp DESC LIMIT 100`)
+		if err != nil {
+			http.Error(w, "Failed to query alerts", http.StatusInternalServerError)
+			return
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var a models.Alert
+			if err := rows.Scan(&a.ID, &a.Timestamp, &a.RuleName, &a.Severity, &a.PodName, &a.Namespace, &a.NodeName, &a.FullCommand, &a.EventID); err != nil {
+				continue
+			}
+			out = append(out, a)
+		}
+	} else {
+		memLock.Lock()
+		out = append(out, memAlerts...)
+		memLock.Unlock()
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(out)
+}
+
 func main() {
-	log.Println("Starting eBPF Runtime Security Backend Service...")
+	log.Println("Starting KubeCustos Backend Service...")
 	connectDB()
 
 	r := mux.NewRouter()
 
 	// API Endpoints
 	r.HandleFunc("/api/v1/events", handleEvents).Methods("POST")
+	r.HandleFunc("/api/v1/alerts", handleGetAlerts).Methods("GET")
 	r.HandleFunc("/health", handleHealth).Methods("GET")
 	
 	// Prometheus Metrics Endpoint
 	r.Handle("/metrics", promhttp.Handler()).Methods("GET")
-	backendRequestsTotal.WithLabelValues("/metrics").Inc() 
+	// metrics handler registered
 
 	port := os.Getenv("PORT")
 	if port == "" {

@@ -15,14 +15,14 @@ RUN go mod download
 COPY . .
 COPY --from=bpf-builder /src/pkg/ebpf/probe.o ./cmd/collector/
 RUN CGO_ENABLED=1 GOOS=linux GOARCH=arm64 \
-    go build -o /collector ./cmd/collector
+    go build -o /kubecustos-collector ./cmd/collector
 
 # --- Stage 3: Final minimal image ---
 FROM --platform=linux/arm64 alpine:latest
 RUN apk add --no-cache ca-certificates
-COPY --from=go-builder /collector /usr/local/bin/collector
+COPY --from=go-builder /kubecustos-collector /usr/local/bin/kubecustos-collector
 
 # --- THIS IS THE FIX ---
 # The collector must run as root to load eBPF programs.
 # We remove the 'adduser' and 'USER nonroot' lines.
-CMD ["collector"]
+CMD ["kubecustos-collector"]
