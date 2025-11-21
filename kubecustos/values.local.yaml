@@ -1,0 +1,44 @@
+## Local values to deploy KubeCustos (for development / testing)
+
+image:
+  collector:
+    repository: your-registry/kubecustos-collector
+    tag: latest
+    pullPolicy: IfNotPresent
+  backend:
+    repository: your-registry/kubecustos-backend
+    tag: latest
+    pullPolicy: IfNotPresent
+
+replicaCount: 1
+
+collector:
+  enabled: true
+  daemonset:
+    hostPID: true
+    privileged: true
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: 250m
+        memory: 256Mi
+
+backend:
+  enabled: true
+  service:
+    type: ClusterIP
+  resources:
+    requests:
+      cpu: 200m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+postgresql:
+  enabled: false # for local dev we'll use backend in-memory fallback
+
+slack:
+  slackWebhookUrl: "" # set in production via Kubernetes Secret

@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "kubecustos.fullname" . }}-grafana-dashboards
+  labels:
+    grafana_dashboard: "1"
+    {{- include "kubecustos.labels" . | nindent 4 }}
+data:
+  ebpf-dashboard.json: |
+{{ .Files.Get "dashboards/ebpf-dashboard.json" | indent 4 }}

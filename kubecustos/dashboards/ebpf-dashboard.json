@@ -1,0 +1,59 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "gnetId": null,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "type": "graph",
+      "title": "Event Rate (events/sec)",
+      "targets": [
+        {"expr": "rate(ebpf_events_total[1m])", "legendFormat": "events/sec"}
+      ],
+      "gridPos": {"x": 0, "y": 0, "w": 12, "h": 6}
+    },
+    {
+      "type": "piechart",
+      "title": "Alert Count by Severity",
+      "targets": [
+        {"expr": "sum by (severity) (ebpf_alerts_total)", "legendFormat": "{{severity}}"}
+      ],
+      "gridPos": {"x": 12, "y": 0, "w": 12, "h": 6}
+    },
+    {
+      "type": "barchart",
+      "title": "Top 10 Processes",
+      "targets": [
+        {"expr": "topk(10, sum by (process) (rate(ebpf_events_total[5m])))", "legendFormat": "{{process}}"}
+      ],
+      "gridPos": {"x": 0, "y": 6, "w": 12, "h": 6}
+    },
+    {
+      "type": "heatmap",
+      "title": "Container Activity Heatmap",
+      "targets": [
+        {"expr": "sum by (pod) (rate(ebpf_events_total[5m]))", "legendFormat": "{{pod}}"}
+      ],
+      "gridPos": {"x": 12, "y": 6, "w": 12, "h": 6}
+    },
+    {
+      "type": "table",
+      "title": "Alert Timeline (recent)",
+      "targets": [
+        {"expr": "ebpf_alerts_total", "legendFormat": "alerts"}
+      ],
+      "gridPos": {"x": 0, "y": 12, "w": 24, "h": 8}
+    }
+  ],
+  "schemaVersion": 27,
+  "style": "dark",
+  "tags": ["ebpf","security"],
+  "templating": {"list": []},
+  "time": {"from": "now-1h", "to": "now"},
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "KubeCustos eBPF Overview",
+  "uid": "kubecustos-ebpf-overview"
+}
