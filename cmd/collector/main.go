@@ -8,10 +8,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -43,6 +45,10 @@ type bpfEvent struct {
 	Comm      [16]byte
 	ArgsBuf   [4096]byte
 	ArgsCount int32
+	CgroupID  uint64
+	UID       uint32
+	_pad      uint32
+	Timestamp uint64
 }
 
 // LocalEventContext holds data required for local enrichment before forwarding.
@@ -71,6 +77,10 @@ var cgroupRegex = regexp.MustCompile(`crio-([a-f0-9]{64})\.scope`)
 var (
 	pidCache = make(map[uint32]string)
 	pidLock  = sync.RWMutex{}
+
+	// cache cgroupID -> containerID lookups
+	cgroupCache = make(map[uint64]string)
+	cgroupLock  = sync.RWMutex{}
 )
 
 // getContainerIDFromPID reads /host/proc/PID/cgroup and extracts the container ID
@@ -109,9 +119,26 @@ func getContainerIDFromPID(pid uint32) (string, bool) {
 }
 
 // FindPodForPID tries the PID first, then falls back to PPID
-func FindPodForPID(podCache *k8s.PodCache, pid, ppid uint32) (string, *v1.Pod) {
+// FindPodForPID attempts to resolve a container ID and Pod for the event.
+// If cgroupID is non-zero it will prefer resolving via kernel cgroup inode mapping,
+// otherwise it falls back to parsing /host/proc/<pid>/cgroup.
+func FindPodForPID(podCache *k8s.PodCache, pid, ppid uint32, cgroupID uint64) (string, *v1.Pod) {
 	dbg("[FIND] resolving pod for pid=%d ppid=%d", pid, ppid)
 
+	// 1) Try using kernel-provided cgroup ID if available
+	if cgroupID != 0 {
+		if cid, ok := getContainerIDFromCgroupID(cgroupID); ok && cid != "" {
+			dbg("[FIND] resolved via cgroupID=%d -> containerID=%s", cgroupID, cid)
+			pod := podCache.FindPodByContainerID(cid)
+			if pod != nil {
+				dbg("[FIND] cgroupID=%d -> pod=%s/%s", cgroupID, pod.Namespace, pod.Name)
+				return cid, pod
+			}
+			// cache hit but pod not found; continue to fallback below
+		}
+	}
+
+	// 2) Fallback: inspect /host/proc/<pid>/cgroup
 	containerID, ok := getContainerIDFromPID(pid)
 	if !ok {
 		return "", nil
@@ -125,7 +152,7 @@ func FindPodForPID(podCache *k8s.PodCache, pid, ppid uint32) (string, *v1.Pod) {
 			return "", nil
 		}
 	}
-	
+
 	if containerID == "" {
 		dbg("[FIND] pid=%d and ppid=%d resolved to host process", pid, ppid)
 		return "", nil
@@ -139,6 +166,65 @@ func FindPodForPID(podCache *k8s.PodCache, pid, ppid uint32) (string, *v1.Pod) {
 		dbg("[FIND] containerID=%s -> no pod found (host or short-lived)", containerID)
 	}
 	return containerID, pod
+}
+
+// getContainerIDFromCgroupID tries to map a kernel cgroup inode id to a container ID
+// by searching under /sys/fs/cgroup for a matching directory inode and extracting
+// a container-like id from the path. This is heuristic and cached to avoid repeated scans.
+func getContainerIDFromCgroupID(cgid uint64) (string, bool) {
+	cgroupLock.RLock()
+	if cid, ok := cgroupCache[cgid]; ok {
+		cgroupLock.RUnlock()
+		dbg("cgroupCache HIT cgid=%d -> %s", cgid, cid)
+		return cid, true
+	}
+	cgroupLock.RUnlock()
+
+	// Search /sys/fs/cgroup (both v1 and v2 layouts)
+	root := "/sys/fs/cgroup"
+	var found string
+	re := regexp.MustCompile(`([a-f0-9]{64})`)
+	_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d == nil || !d.IsDir() {
+			return nil
+		}
+		// stat the directory and compare inode
+		fi, err := os.Stat(path)
+		if err != nil {
+			return nil
+		}
+		st, ok := fi.Sys().(*syscall.Stat_t)
+		if !ok {
+			return nil
+		}
+		if uint64(st.Ino) == cgid {
+			// heuristically extract a 64-hex container id from the path
+			if m := re.FindStringSubmatch(path); len(m) >= 2 {
+				found = m[1]
+			} else {
+				// fallback: try to parse after last '/'
+				base := filepath.Base(path)
+				if len(base) >= 12 {
+					found = base
+				}
+			}
+			return fs.SkipDir
+		}
+		return nil
+	})
+
+	if found != "" {
+		cgroupLock.Lock()
+		cgroupCache[cgid] = found
+		cgroupLock.Unlock()
+		dbg("cgroup resolved cgid=%d -> %s", cgid, found)
+		return found, true
+	}
+	// cache negative result
+	cgroupLock.Lock()
+	cgroupCache[cgid] = ""
+	cgroupLock.Unlock()
+	return "", true
 }
 
 // sendToBackend converts the enriched event and sends it via HTTP to the backend service.
@@ -334,8 +420,8 @@ func main() {
 		fullCommand := strings.Join(args, " ")
 		dbg("[EVENT] pid=%d parsed fullCommand=%q", event.Pid, fullCommand)
 
-		// Look up Pod and get the raw Container ID
-		containerID, sourcePod := FindPodForPID(podCache, event.Pid, event.Ppid)
+	// Look up Pod and get the raw Container ID (prefer kernel cgroup id when available)
+	containerID, sourcePod := FindPodForPID(podCache, event.Pid, event.Ppid, event.CgroupID)
 
 		localEvent := LocalEventContext{
 			PID:         event.Pid,

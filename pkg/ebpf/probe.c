@@ -17,6 +17,9 @@ struct event {
     char args_buf[ARGS_BUF_SIZE];
     int args_count;
     u64 cgroup_id; // capture kernel cgroup inode id
+    u32 uid;       // caller UID (from kernel)
+    u32 __pad;     // padding for alignment
+    u64 ts;        // kernel timestamp (ns)
 };
 
 struct {
@@ -56,6 +59,11 @@ int handle_execve(struct trace_event_raw_sys_enter *ctx) {
 
     /* Save cgroup id for userspace pod resolution (stable across short-lived PIDs) */
     e->cgroup_id = bpf_get_current_cgroup_id();
+
+    /* Capture UID and kernel timestamp for higher-fidelity events */
+    u64 uid_gid = bpf_get_current_uid_gid();
+    e->uid = (u32)(uid_gid & 0xFFFFFFFF);
+    e->ts = bpf_ktime_get_ns();
 
     /* Read argv[0] */
     const char *filename = (const char *)ctx->args[0];
